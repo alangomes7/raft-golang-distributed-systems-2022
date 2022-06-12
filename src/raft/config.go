@@ -21,7 +21,10 @@ import "fmt"
 
 func randstring(n int) string {
 	b := make([]byte, 2*n)
-	crand.Read(b)
+	read, err := crand.Read(b)
+	if err != nil {
+		return fmt.Sprintf("%d%s", read, "")
+	}
 	s := base64.URLEncoding.EncodeToString(b)
 	return s[0:n]
 }
@@ -38,9 +41,17 @@ type config struct {
 	saved     []*Persister
 	endnames  [][]string    // the port file names each sends to
 	logs      []map[int]int // copy of each server's committed entries
+	start     time.Time     // time at which makeConfig() was called
+	// begin()/end() statistics
+	t0        time.Time // time at which test_test.go called cfg.begin()
+	rpcs0     int       // rpcTotal() at start of test
+	cmds0     int       // number of agreements
+	bytes0    int64
+	maxIndex  int
+	maxIndex0 int
 }
 
-func make_config(t *testing.T, n int, unreliable bool) *config {
+func makeConfig(t *testing.T, n int, unreliable bool) *config {
 	runtime.GOMAXPROCS(4)
 	cfg := &config{}
 	cfg.t = t
@@ -102,13 +113,11 @@ func (cfg *config) crash1(i int) {
 	}
 }
 
-//
 // start or re-start a Raft.
 // if one already exists, "kill" it first.
 // allocate new outgoing port file names, and a new
 // state persister, to isolate previous instance of
 // this server. since we cannot really kill it.
-//
 func (cfg *config) start1(i int) {
 	cfg.crash1(i)
 
@@ -144,32 +153,41 @@ func (cfg *config) start1(i int) {
 	applyCh := make(chan ApplyMsg)
 	go func() {
 		for m := range applyCh {
-			err_msg := ""
-			if m.UseSnapshot {
-				// ignore the snapshot
-			} else if v, ok := (m.Command).(int); ok {
+			errMsg := ""
+			if m.CommandValid == false {
+				// ignore other types of ApplyMsg
+			} else {
+				v := m.Command
 				cfg.mu.Lock()
 				for j := 0; j < len(cfg.logs); j++ {
-					if old, oldok := cfg.logs[j][m.Index]; oldok && old != v {
+					if old, oldok := cfg.logs[j][m.CommandIndex]; oldok && old != v {
 						// some server has already committed a different value for this entry!
-						err_msg = fmt.Sprintf("commit index=%v server=%v %v != server=%v %v",
-							m.Index, i, m.Command, j, old)
+						for z := range cfg.rafts {
+							fmt.Printf("[ID=%d]_[LOG=%v]\n", z, cfg.rafts[z].log)
+						}
+						errMsg = fmt.Sprintf("commit index=%v server=%v %v != server=%v %v",
+							m.CommandIndex, i, m.Command, j, old)
 					}
 				}
-				_, prevok := cfg.logs[i][m.Index-1]
-				cfg.logs[i][m.Index] = v
+				_, prevok := cfg.logs[i][m.CommandIndex-1]
+				//cfg.logs[i][m.CommandIndex] = v
+				cfg.logs[i][m.CommandIndex] = 0
+				if m.CommandIndex > cfg.maxIndex {
+					cfg.maxIndex = m.CommandIndex
+				}
 				cfg.mu.Unlock()
 
-				if m.Index > 1 && prevok == false {
-					err_msg = fmt.Sprintf("server %v apply out of order %v", i, m.Index)
+				if m.CommandIndex > 1 && prevok == false {
+					for i := range cfg.rafts {
+						fmt.Println(cfg.rafts[i].log)
+					}
+					errMsg = fmt.Sprintf("[%s]-server %v apply out of order %v", time.Now().Format(time.StampMicro), i, m.CommandIndex)
 				}
-			} else {
-				err_msg = fmt.Sprintf("committed command %v is not an int", m.Command)
 			}
 
-			if err_msg != "" {
-				log.Fatalf("apply error: %v\n", err_msg)
-				cfg.applyErr[i] = err_msg
+			if errMsg != "" {
+				cfg.applyErr[i] = errMsg
+				log.Fatalf("apply error: %v\n", errMsg)
 				// keep reading after error so that Raft doesn't block
 				// holding locks...
 			}
@@ -186,6 +204,14 @@ func (cfg *config) start1(i int) {
 	srv := labrpc.MakeServer()
 	srv.AddService(svc)
 	cfg.net.AddServer(i, srv)
+}
+
+// check node's timeout
+func (cfg *config) checkTimeout() {
+	// enforce a two minute real-time limit on each test
+	if !cfg.t.Failed() && time.Since(cfg.start) > 120*time.Second {
+		cfg.t.Fatal("test took longer than 120 seconds")
+	}
 }
 
 func (cfg *config) cleanup() {
@@ -307,8 +333,8 @@ func (cfg *config) checkTerms() int {
 func (cfg *config) checkNoLeader() {
 	for i := 0; i < cfg.n; i++ {
 		if cfg.connected[i] {
-			_, is_leader := cfg.rafts[i].GetState()
-			if is_leader {
+			_, isLeader := cfg.rafts[i].GetState()
+			if isLeader {
 				cfg.t.Fatalf("expected no leader, but %v claims to be leader", i)
 			}
 		}
